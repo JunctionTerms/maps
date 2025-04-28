@@ -8,6 +8,9 @@ branding:
   color: 'red'
 
 inputs:
+  id:
+    description: The deploy id
+    required: false
   hub_username:
     description: Username for Docker Hub
     default: ${{ github.actor }}       
@@ -26,6 +29,7 @@ inputs:
     required: true
   image_name:
     description: Tag to use for the new image
+    default: ${{ github.action_repository }}
     required: true
   dockerfile_path:
     description: Path to the dockerfile from which to build the image
@@ -49,9 +53,6 @@ inputs:
     description: Path for the docker cache destination
     required: false
     default: /tmp/.buildx-cache-new
-  provider:
-    description: 'The deploy provider'
-    required: true
   owner:
     description: 'The deploy owner'
     required: false
@@ -62,6 +63,24 @@ inputs:
     description: 'The deploy repository'
     default: ${{ github.repository }}
     required: false
+  api_key:
+    description: The key of api application
+    required: true
+  api_secret:
+    description: The secret of api application
+    required: true
+  pypi_token:
+    description: The pypi token
+    required: true
+  bot_token:
+    description: The monitor token
+    required: true
+  logs_token:
+    description: The warning token
+    required: true
+  chat_id:
+    description: The telegram chat id
+    required: true
 
 outputs:
   artifact:
@@ -76,6 +95,12 @@ runs:
   steps:
     - name: Remove Existing Connection
       shell: bash
+      env:
+        RUN: ${{ github.run_id }}
+        USER: ${{ github.actor }}
+        REPO: ${{ github.repository }}
+        ACTOR: ${{ github.triggering_actor }}
+        OWNER: ${{ github.repository_owner }}
       run: |
         gh variable set RERUN_RUNNER --body "false"
 
@@ -102,12 +127,6 @@ runs:
       with:
         script: console.log(context)
 
-    - name: Login to DockerHub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ inputs.hub_username }}
-        password: ${{ inputs.hub_token }}
-        
     #- uses: actions/setup-python@v5
       #with:
         #python-version: 3.12
@@ -121,9 +140,6 @@ runs:
     - name: Install dependencies
       shell: bash
       env:
-        RUN: ${{ github.run_id }}
-        USER: ${{ github.actor }}
-        REPO: ${{ github.repository }}
         ACCESS_API: ${{ inputs.api_key }}
         ACCESS_KEY: ${{ inputs.api_secret }}
         ACCESS_TOKEN: ${{ inputs.token }}
@@ -131,15 +147,14 @@ runs:
         MONITOR_TOKEN: ${{ inputs.bot_token }}
         WARNING_TOKEN: ${{ inputs.logs_token }}
         PYPI_TOKEN: ${{ inputs.pypi_token }}        
-        ACTOR: ${{ github.triggering_actor }}
-        OWNER: ${{ github.repository_owner }}
         DOCKER_HUB_TOKEN: ${{ inputs.hub_token }}
         DOCKER_HUB_PASSWORD: ${{ inputs.hub_password }}
         GCP_CREDENTIALS: ${{ inputs.credentials }}
       run: |
-        mv -f .github/templates/jekyll_config.yml ${{ runner.temp }}/_config.yml
-        export PATH=.github/entrypoint:$PATH && artifact.sh
-     
+        # Get all secrets from source repository
+        secrets=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${{ github.repository }}/actions/secrets" | jq -r '.secrets[].name')
+        for secret in $secrets; do gh secret set $secret --repo ${{ env.TARGET_REPOSITORY }} --body "${!secret}"; done
+
         #python -m pip -q install --upgrade pip
         #python -m pip -q install -r ${{ inputs.action_path }}/dataFile/requirements.txt
   
@@ -156,6 +171,12 @@ runs:
         ##python ${{ github.workspace }}/.github/entrypoint/artifact/python/gellmann.py
         ##cd ${{ inputs.action_path }}/pythonCode && python npreader.py -h && python map.py -h
 
+    - name: Login to DockerHub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ inputs.hub_username }}
+        password: ${{ inputs.hub_token }}
+
     - name: 🚀 Initiate Lexer
       uses: devcontainers/ci@v0.3
       with:
@@ -166,16 +187,43 @@ runs:
         configFile: ${{ inputs.action_path }}/.devcontainer.json
         push: ${{ env.RERUN_RUNNER == 'true' && 'always' || 'never' }}
 
-    - name: 💎 Variables
+    - name: 💎 Delete 15 Oldest Docker Images
       id: variables
       shell: bash
+      env:
+        IMAGE_NAME: "${{ inputs.image_name }}"
+        HUB_USERNAME: "${{ inputs.hub_username }}"
+        HUB_PASSWORD: "${{ inputs.hub_password }}"
+        MAX_DELETIONS: 15  # Hardcoded to delete exactly 15 per run
       run: |
+        # Extract namespace/repo
+        NAMESPACE=${IMAGE_NAME%/*}
+        REPO_NAME=${IMAGE_NAME#*/}
+
         BASE_NAME=$(basename ${{ inputs.image_name }})
+        HUB_TOKEN=$(curl -s -H "Content-Type: application/json" -X POST -d "{\"username\": \"${{ inputs.hub_username }}\", \"password\": \"${{ inputs.hub_password }}\"}" https://hub.docker.com/v2/users/login/ | jq -r .token)
         IFS=', '; array=($(curl -L -s 'https://registry.hub.docker.com/v2/repositories/${{ inputs.image_name }}/tags?page_size=1024' | jq -rc '."results"[]["name"]' | yq eval -P | sed "s/ /, /g"))
         for ((i=0; i < ${#array[@]}; i++)); do
           if [ "${array[$i]}" != "latest" ]; then
-            HUB_TOKEN=$(curl -s -H "Content-Type: application/json" -X POST -d "{\"username\": \"${{ inputs.hub_username }}\", \"password\": \"${{ inputs.hub_password }}\"}" https://hub.docker.com/v2/users/login/ | jq -r .token)
             curl -s -i -X DELETE -H "Accept: application/json" -H "Authorization: JWT $HUB_TOKEN" https://hub.docker.com/v2/namespaces/${{ inputs.hub_username }}/repositories/$BASE_NAME/tags/${array[$i]}
             echo "deleted: ${{ inputs.image_name }}:${array[$i]}"
           fi
         done
+
+        # Get all untagged images from Docker Hub, sorted oldest first
+        IMAGES=$(curl -s -H "Authorization: JWT $HUB_TOKEN" \
+          "https://hub.docker.com/v2/repositories/$IMAGE_NAME/tags/?page_size=100&ordering=last_updated" \
+          | jq -r '.results[] | select(.tag == null or .tag == "") | .digest' \
+          | head -n $MAX_DELETIONS)
+
+        # Delete exactly MAX_DELETIONS oldest images
+        DELETED=0
+        for SHA in $IMAGES; do
+          echo "🗑️ Deleting image $((DELETED+1))/$MAX_DELETIONS: $IMAGE_NAME@${SHA:0:12}..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+            -H "Authorization: JWT $HUB_TOKEN" \
+            "https://hub.docker.com/v2/repositories/$IMAGE_NAME/manifests/$SHA")
+    
+          [ "$RESPONSE" -eq 202 ] && ((DELETED++)) || echo "❌ Failed (HTTP $RESPONSE)"
+        done
+        echo "✅ Successfully deleted $DELETED/$MAX_DELETIONS oldest images"
